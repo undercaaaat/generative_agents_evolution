@@ -127,9 +127,20 @@ def run_reflect(persona):
       thought_poignancy = generate_poig_score(persona, "thought", thought)
       thought_embedding_pair = (thought, get_embedding(thought))
 
-      persona.a_mem.add_thought(created, expiration, s, p, o, 
-                                thought, keywords, thought_poignancy, 
+      persona.a_mem.add_thought(created, expiration, s, p, o,
+                                thought, keywords, thought_poignancy,
                                 thought_embedding_pair, evidence)
+
+      # Telemetry (P2): generated insights are internal cognition -> agent_internal/.
+      try:
+        import telemetry_log
+        telemetry_log.log_event("reflect", {
+            "stage": "reflect", "persona": persona.scratch.name,
+            "focal_pt": focal_pt, "thought": thought,
+            "spo": [s, p, o], "evidence": evidence,
+            "poignancy": thought_poignancy})
+      except Exception:
+        pass
 
 
 def reflection_trigger(persona): 

@@ -12,6 +12,7 @@ import time
 sys.path.append('../../')
 
 from global_methods import *
+from utils import ga_hourly_schedule_retries
 from persona.prompt_template.run_gpt_prompt import *
 from persona.cognitive_modules.retrieve import *
 from persona.cognitive_modules.converse import *
@@ -89,24 +90,78 @@ def generate_hourly_schedule(persona, wake_up_hour):
   """
   if debug: print ("GNS FUNCTION: <generate_hourly_schedule>")
 
+  def is_sleep_activity(activity):
+    activity = str(activity).lower()
+    return ("sleep" in activity or "asleep" in activity or "in bed" in activity)
+
+  def get_daily_work_text():
+    daily_plan_req = persona.scratch.get_str_daily_plan_req()
+    if daily_plan_req:
+      return daily_plan_req
+    usable_daily_req = [i for i in persona.scratch.daily_req
+                        if not is_sleep_activity(i)]
+    usable_daily_req = [i for i in usable_daily_req
+                        if "wake up" not in i.lower()]
+    if usable_daily_req:
+      return usable_daily_req[0]
+    return "planned activities for the day"
+
+  def build_conservative_hourly_schedule():
+    daily_work_text = get_daily_work_text()
+    fallback = []
+    for hour in range(24):
+      if hour < wake_up_hour:
+        fallback += ["sleeping"]
+      elif hour == wake_up_hour:
+        fallback += ["waking up and completing the morning routine"]
+      elif hour < 12:
+        fallback += [f"working on the day's plan: {daily_work_text}"]
+      elif hour == 12:
+        fallback += ["having lunch"]
+      elif hour < 18:
+        fallback += [f"continuing the day's plan: {daily_work_text}"]
+      elif hour == 18:
+        fallback += ["having dinner"]
+      elif hour < 23:
+        fallback += ["winding down and preparing for the next day"]
+      else:
+        fallback += ["sleeping"]
+    return fallback
+
+  def needs_conservative_schedule(activity_list):
+    if len(activity_list) != 24:
+      return True
+    awake_window = activity_list[wake_up_hour:23]
+    if not awake_window:
+      return True
+    sleep_count = sum(1 for i in awake_window if is_sleep_activity(i))
+    unique_awake = set(i for i in awake_window if not is_sleep_activity(i))
+    return sleep_count > 2 or len(unique_awake) < 3
+
   hour_str = ["00:00 AM", "01:00 AM", "02:00 AM", "03:00 AM", "04:00 AM", 
               "05:00 AM", "06:00 AM", "07:00 AM", "08:00 AM", "09:00 AM", 
               "10:00 AM", "11:00 AM", "12:00 PM", "01:00 PM", "02:00 PM", 
               "03:00 PM", "04:00 PM", "05:00 PM", "06:00 PM", "07:00 PM",
               "08:00 PM", "09:00 PM", "10:00 PM", "11:00 PM"]
   n_m1_activity = []
-  diversity_repeat_count = 3
+  diversity_repeat_count = ga_hourly_schedule_retries
   for i in range(diversity_repeat_count): 
     n_m1_activity_set = set(n_m1_activity)
     if len(n_m1_activity_set) < 5: 
       n_m1_activity = []
+      remaining_sleep_hours = wake_up_hour
       for count, curr_hour_str in enumerate(hour_str): 
-        if wake_up_hour > 0: 
+        if remaining_sleep_hours > 0: 
           n_m1_activity += ["sleeping"]
-          wake_up_hour -= 1
+          remaining_sleep_hours -= 1
         else: 
           n_m1_activity += [run_gpt_prompt_generate_hourly_schedule(
                           persona, curr_hour_str, n_m1_activity, hour_str)[0]]
+
+  if needs_conservative_schedule(n_m1_activity):
+    if debug:
+      print("Using conservative hourly schedule fallback.")
+    n_m1_activity = build_conservative_hourly_schedule()
   
   # Step 1. Compressing the hourly schedule to the following format: 
   # The integer indicates the number of hours. They should add up to 24. 
@@ -486,7 +541,9 @@ def _long_term_planning(persona, new_day):
 
     # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - TODO
     # We need to create a new daily_req here...
-    persona.scratch.daily_req = persona.scratch.daily_req
+    if not persona.scratch.daily_req or len(persona.scratch.daily_req) < 2:
+      persona.scratch.daily_req = generate_first_daily_plan(persona, 
+                                                            wake_up_hour)
 
   # Based on the daily_req, we create an hourly schedule for the persona, 
   # which is a list of todo items with a time duration (in minutes) that 
@@ -595,12 +652,13 @@ def _determine_action(persona, maze):
   # Generate an <Action> instance from the action description and duration. By
   # this point, we assume that all the relevant actions are decomposed and 
   # ready in f_daily_schedule. 
-  print ("DEBUG LJSDLFSKJF")
-  for i in persona.scratch.f_daily_schedule: print (i)
-  print (curr_index)
-  print (len(persona.scratch.f_daily_schedule))
-  print (persona.scratch.name)
-  print ("------")
+  if debug:
+    print ("DEBUG LJSDLFSKJF")
+    for i in persona.scratch.f_daily_schedule: print (i)
+    print (curr_index)
+    print (len(persona.scratch.f_daily_schedule))
+    print (persona.scratch.name)
+    print ("------")
 
   # 1440
   x_emergency = 0
@@ -608,9 +666,10 @@ def _determine_action(persona, maze):
     x_emergency += i[1]
   # print ("x_emergency", x_emergency)
 
-  if 1440 - x_emergency > 0: 
+  remaining_day_minutes = 1440 - x_emergency
+  if remaining_day_minutes > 0: 
     print ("x_emergency__AAA", x_emergency)
-  persona.scratch.f_daily_schedule += [["sleeping", 1440 - x_emergency]]
+    persona.scratch.f_daily_schedule += [["sleeping", remaining_day_minutes]]
   
 
 
@@ -629,6 +688,31 @@ def _determine_action(persona, maze):
   act_game_object = generate_action_game_object(act_desp, act_address,
                                                 persona, maze)
   new_address = f"{act_world}:{act_sector}:{act_arena}:{act_game_object}"
+
+  # C2.5 constraint planner (guide 7.8): validate the chosen action address and
+  # log the result to agent_internal/plans. This wiring is non-destructive --
+  # it records validator_result but does NOT yet reject/replan (GA's own
+  # fail-safes already handle infeasible addresses), protecting the validated
+  # frame-0 movement path. Active rejection/replan is escalated in pilot.
+  try:
+    from scaffolding import conditions
+    if conditions.constraint_planner_on():
+      from scaffolding.validator import PlanContext, validate_plan
+      resolvable = new_address in maze.address_tiles
+      _locs = {new_address} if resolvable else set()
+      _ctx = PlanContext(known_locations=_locs, open_locations=_locs,
+                         reachable_locations=_locs)
+      _plan_obj = {"agent_id": persona.name, "goal": act_desp,
+                   "location": new_address, "required_resources": [],
+                   "preconditions": []}
+      _res = validate_plan(_plan_obj, _ctx)
+      import telemetry_log
+      telemetry_log.log_event("plan", dict(_res.as_dict(), stage="validator",
+                              persona=persona.name, goal=act_desp,
+                              location=new_address))
+  except Exception:
+    pass
+
   act_pron = generate_action_pronunciatio(act_desp, persona)
   act_event = generate_action_event_triple(act_desp, persona)
   # Persona's actions also influence the object states. We set those up here. 
@@ -864,9 +948,27 @@ def _chat_react(maze, persona, focused_event, reaction_mode, personas):
   target_persona = personas[reaction_mode[9:].strip()]
   curr_personas = [init_persona, target_persona]
 
-  # Actually creating the conversation here. 
+  # Actually creating the conversation here.
   convo, duration_min = generate_convo(maze, init_persona, target_persona)
   convo_summary = generate_convo_summary(init_persona, convo)
+
+  # C4 social transmission (guide 11.5): after the conversation, each party may
+  # adopt/adapt the other's active strategy. agent_internal only -- the
+  # observable teaching trace is the conversation itself (raw/dialogue). Guarded
+  # by transmission_on() (C4); no-op otherwise. Never breaks the conversation.
+  try:
+    from scaffolding import conditions
+    if conditions.transmission_on():
+      from scaffolding import strategy as _st
+      from scaffolding import transmission as _tx
+      _ct = target_persona.scratch.curr_time
+      for _learner, _teacher in ((target_persona, init_persona),
+                                 (init_persona, target_persona)):
+        _ts = _st.active_strategies(_teacher.name)
+        if _ts:
+          _tx.run_transmission(_learner.name, _teacher.name, _ts[-1], _ct)
+  except Exception:
+    pass
   inserted_act = convo_summary
   inserted_act_dur = duration_min
 
@@ -1001,8 +1103,21 @@ def plan(persona, maze, personas, new_day, retrieved):
   # immediately after chatting once. We keep track of the buffer value here. 
   curr_persona_chat_buffer = persona.scratch.chatting_with_buffer
   for persona_name, buffer_count in curr_persona_chat_buffer.items():
-    if persona_name != persona.scratch.chatting_with: 
+    if persona_name != persona.scratch.chatting_with:
       persona.scratch.chatting_with_buffer[persona_name] -= 1
+
+  # Telemetry (P2): the planning rationale / chosen act_address is internal
+  # decision process -> agent_internal/. The executed action is logged in raw/
+  # by execute(); only the observable outcome is evaluator-readable.
+  try:
+    import telemetry_log
+    telemetry_log.log_event("plan", {
+        "stage": "plan", "persona": persona.scratch.name,
+        "new_day": new_day,
+        "act_address": persona.scratch.act_address,
+        "act_description": persona.scratch.act_description})
+  except Exception:
+    pass
 
   return persona.scratch.act_address
 

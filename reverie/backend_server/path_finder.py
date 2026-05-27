@@ -136,26 +136,45 @@ def path_finder_v2(a, start, end, collision_block_char, verbose=False):
         break
       except_handle -= 1 
 
+  # If we still cannot reach the target, fail gracefully by staying put.
+  if m[end[0]][end[1]] == 0:
+    return [start]
+
   i, j = end
   k = m[i][j]
   the_path = [(i,j)]
-  while k > 1:
+  # Safety guard: malformed wavefront states can otherwise trap this loop.
+  max_backtrack_steps = len(m) * len(m[0]) + 5
+  while k > 1 and max_backtrack_steps > 0:
+    moved = False
     if i > 0 and m[i - 1][j] == k-1:
       i, j = i-1, j
       the_path.append((i, j))
       k-=1
+      moved = True
     elif j > 0 and m[i][j - 1] == k-1:
       i, j = i, j-1
       the_path.append((i, j))
       k-=1
+      moved = True
     elif i < len(m) - 1 and m[i + 1][j] == k-1:
       i, j = i+1, j
       the_path.append((i, j))
       k-=1
+      moved = True
     elif j < len(m[i]) - 1 and m[i][j + 1] == k-1:
       i, j = i, j+1
       the_path.append((i, j))
       k -= 1
+      moved = True
+
+    if not moved:
+      # Cannot trace a valid predecessor path; return a safe fallback.
+      return [start]
+    max_backtrack_steps -= 1
+
+  if k > 1:
+    return [start]
         
   the_path.reverse()
   return the_path

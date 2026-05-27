@@ -11,7 +11,100 @@ import time
 
 from utils import *
 
+try:
+  import telemetry_log
+except Exception:
+  telemetry_log = None
+
 openai.api_key = openai_api_key
+openai.api_base = llm_api_base
+openai.proxy = apply_network_proxy()
+
+_LEGACY_COMPLETION_ENGINES = ("text-davinci-002", "text-davinci-003")
+_API_ERROR_PREFIXES = ("GPT REQUEST ERROR", "ChatGPT ERROR")
+
+
+def _meter(call_type, model, response):
+  """Record token usage from an API response. Side-effect-free; never raises."""
+  if telemetry_log is None:
+    return
+  try:
+    if hasattr(response, "get"):
+      usage = response.get("usage")
+    else:
+      usage = getattr(response, "usage", None)
+  except Exception:
+    usage = None
+  telemetry_log.record_llm_call(call_type, model, usage)
+
+
+def _print_api_error(label, error):
+  print(f"{label} ({type(error).__name__}): {error}")
+
+
+def _is_api_error_response(response):
+  return (isinstance(response, str)
+          and response.startswith(_API_ERROR_PREFIXES))
+
+
+def is_api_error_response(response):
+  return _is_api_error_response(response)
+
+
+def _chat_completion_create(model, messages, **kwargs):
+  kwargs.update({
+    "model": model,
+    "messages": messages,
+    "request_timeout": llm_request_timeout,
+  })
+  headers = get_openrouter_headers()
+  if headers:
+    kwargs["headers"] = headers
+  response = openai.ChatCompletion.create(**kwargs)
+  _meter("chat", model, response)
+  return response
+
+
+def _completion_create(**kwargs):
+  kwargs.setdefault("request_timeout", llm_request_timeout)
+  headers = get_openrouter_headers()
+  if headers:
+    kwargs["headers"] = headers
+  response = openai.Completion.create(**kwargs)
+  _meter("completion", kwargs.get("model"), response)
+  return response
+
+
+def _embedding_create(input, model):
+  kwargs = {"input": input, "model": model, "request_timeout": llm_request_timeout}
+  headers = get_openrouter_headers()
+  if headers:
+    kwargs["headers"] = headers
+  response = openai.Embedding.create(**kwargs)
+  _meter("embedding", model, response)
+  return response
+
+
+def _should_use_chat_completion(model):
+  return llm_provider == "openrouter" or "/" in model or model.startswith("gpt-")
+
+
+def _chat_request_from_completion_prompt(prompt, model, gpt_parameter):
+  kwargs = {
+    "temperature": gpt_parameter["temperature"],
+    "max_tokens": gpt_parameter["max_tokens"],
+    "top_p": gpt_parameter["top_p"],
+    "frequency_penalty": gpt_parameter["frequency_penalty"],
+    "presence_penalty": gpt_parameter["presence_penalty"],
+    "stop": gpt_parameter["stop"],
+  }
+  kwargs = {key: value for key, value in kwargs.items() if value is not None}
+  completion = _chat_completion_create(
+    model=model,
+    messages=[{"role": "user", "content": prompt}],
+    **kwargs,
+  )
+  return completion["choices"][0]["message"]["content"]
 
 def temp_sleep(seconds=0.1):
   time.sleep(seconds)
@@ -19,9 +112,9 @@ def temp_sleep(seconds=0.1):
 def ChatGPT_single_request(prompt): 
   temp_sleep()
 
-  completion = openai.ChatCompletion.create(
-    model="gpt-3.5-turbo", 
-    messages=[{"role": "user", "content": prompt}]
+  completion = _chat_completion_create(
+    model=llm_chat_model,
+    messages=[{"role": "user", "content": prompt}],
   )
   return completion["choices"][0]["message"]["content"]
 
@@ -45,14 +138,14 @@ def GPT4_request(prompt):
   temp_sleep()
 
   try: 
-    completion = openai.ChatCompletion.create(
-    model="gpt-4", 
-    messages=[{"role": "user", "content": prompt}]
+    completion = _chat_completion_create(
+      model=llm_gpt4_model,
+      messages=[{"role": "user", "content": prompt}],
     )
     return completion["choices"][0]["message"]["content"]
   
-  except: 
-    print ("ChatGPT ERROR")
+  except Exception as e: 
+    _print_api_error("ChatGPT ERROR", e)
     return "ChatGPT ERROR"
 
 
@@ -70,14 +163,14 @@ def ChatGPT_request(prompt):
   """
   # temp_sleep()
   try: 
-    completion = openai.ChatCompletion.create(
-    model="gpt-3.5-turbo", 
-    messages=[{"role": "user", "content": prompt}]
+    completion = _chat_completion_create(
+      model=llm_chat_model,
+      messages=[{"role": "user", "content": prompt}],
     )
     return completion["choices"][0]["message"]["content"]
   
-  except: 
-    print ("ChatGPT ERROR")
+  except Exception as e: 
+    _print_api_error("ChatGPT ERROR", e)
     return "ChatGPT ERROR"
 
 
@@ -208,8 +301,13 @@ def GPT_request(prompt, gpt_parameter):
   """
   temp_sleep()
   try: 
-    response = openai.Completion.create(
-                model=gpt_parameter["engine"],
+    engine = gpt_parameter.get("engine", llm_completion_model)
+    if engine in _LEGACY_COMPLETION_ENGINES:
+      engine = llm_completion_model
+    if _should_use_chat_completion(engine):
+      return _chat_request_from_completion_prompt(prompt, engine, gpt_parameter)
+    response = _completion_create(
+                model=engine,
                 prompt=prompt,
                 temperature=gpt_parameter["temperature"],
                 max_tokens=gpt_parameter["max_tokens"],
@@ -219,9 +317,9 @@ def GPT_request(prompt, gpt_parameter):
                 stream=gpt_parameter["stream"],
                 stop=gpt_parameter["stop"],)
     return response.choices[0].text
-  except: 
-    print ("TOKEN LIMIT EXCEEDED")
-    return "TOKEN LIMIT EXCEEDED"
+  except Exception as e: 
+    _print_api_error("GPT REQUEST ERROR", e)
+    return "GPT REQUEST ERROR"
 
 
 def generate_prompt(curr_input, prompt_lib_file): 
@@ -264,8 +362,16 @@ def safe_generate_response(prompt,
 
   for i in range(repeat): 
     curr_gpt_response = GPT_request(prompt, gpt_parameter)
-    if func_validate(curr_gpt_response, prompt=prompt): 
-      return func_clean_up(curr_gpt_response, prompt=prompt)
+    if _is_api_error_response(curr_gpt_response):
+      if verbose or debug:
+        print ("API ERROR FAIL SAFE: ", curr_gpt_response)
+      return fail_safe_response
+    try:
+      if func_validate(curr_gpt_response, prompt=prompt): 
+        return func_clean_up(curr_gpt_response, prompt=prompt)
+    except Exception as e:
+      if verbose or debug:
+        _print_api_error("GPT VALIDATION ERROR", e)
     if verbose: 
       print ("---- repeat count: ", i, curr_gpt_response)
       print (curr_gpt_response)
@@ -273,12 +379,13 @@ def safe_generate_response(prompt,
   return fail_safe_response
 
 
-def get_embedding(text, model="text-embedding-ada-002"):
+def get_embedding(text, model=None):
   text = text.replace("\n", " ")
   if not text: 
     text = "this is blank"
-  return openai.Embedding.create(
-          input=[text], model=model)['data'][0]['embedding']
+  embedding_model = model or llm_embedding_model
+  return _embedding_create(
+          input=[text], model=embedding_model)['data'][0]['embedding']
 
 
 if __name__ == '__main__':

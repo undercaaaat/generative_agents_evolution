@@ -178,6 +178,17 @@ def perceive(persona, maze):
       persona.scratch.importance_trigger_curr -= event_poignancy
       persona.scratch.importance_ele_n += 1
 
+  # Telemetry (P2): perceived observations are observable world facts -> raw/.
+  try:
+    import telemetry_log
+    telemetry_log.log_event("events", {
+        "stage": "perceive", "persona": persona.name,
+        "n_perceived": len(ret_events),
+        "events": [getattr(e, "description", str(e)) for e in ret_events],
+        "node_ids": [getattr(e, "node_id", None) for e in ret_events]})
+  except Exception:
+    pass
+
   return ret_events
 
 

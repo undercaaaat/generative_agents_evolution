@@ -11,6 +11,16 @@ import time
 
 from utils import *
 openai.api_key = openai_api_key
+openai.api_base = llm_api_base
+openai.proxy = apply_network_proxy()
+
+
+def _chat_completion_create(model, messages):
+  kwargs = {"model": model, "messages": messages}
+  headers = get_openrouter_headers()
+  if headers:
+    kwargs["headers"] = headers
+  return openai.ChatCompletion.create(**kwargs)
 
 def ChatGPT_request(prompt): 
   """
@@ -26,8 +36,8 @@ def ChatGPT_request(prompt):
   """
   # temp_sleep()
   try: 
-    completion = openai.ChatCompletion.create(
-    model="gpt-3.5-turbo", 
+    completion = _chat_completion_create(
+    model=llm_chat_model, 
     messages=[{"role": "user", "content": prompt}]
     )
     return completion["choices"][0]["message"]["content"]

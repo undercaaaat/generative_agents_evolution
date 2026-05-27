@@ -42,7 +42,38 @@ def retrieve(persona, perceived):
     relevant_thoughts = persona.a_mem.retrieve_relevant_thoughts(
                           event.subject, event.predicate, event.object)
     retrieved[event.description]["thoughts"] = list(relevant_thoughts)
-    
+
+  # Telemetry (P2): which memories were retrieved is internal decision process
+  # -> agent_internal/ (evaluator-forbidden by the firewall).
+  try:
+    import telemetry_log
+    _typed_on = False
+    try:
+      from scaffolding import conditions
+      _typed_on = conditions.typed_memory_on()
+    except Exception:
+      _typed_on = False
+    _annotate = None
+    if _typed_on:
+      from scaffolding import typed_memory as _tm
+      _annotate = _tm.annotate
+    _summary = {}
+    for _k, _v in retrieved.items():
+      _entry = {
+          "event_ids": [getattr(n, "node_id", None) for n in _v.get("events", [])],
+          "thought_ids": [getattr(n, "node_id", None) for n in _v.get("thoughts", [])]}
+      # C2.5 typed memory (guide 7.3): attach the typed overlay of retrieved
+      # nodes. Internal representation -> agent_internal/ (firewall). Additive.
+      if _annotate is not None:
+        _entry["typed"] = [_annotate(n)
+                           for n in _v.get("events", []) + _v.get("thoughts", [])]
+      _summary[_k] = _entry
+    telemetry_log.log_event("retrieve", {
+        "stage": "retrieve", "persona": persona.name, "typed_memory": _typed_on,
+        "focal_events": list(retrieved.keys()), "retrieved": _summary})
+  except Exception:
+    pass
+
   return retrieved
 
 
@@ -255,8 +286,27 @@ def new_retrieve(persona, focal_points, n_count=30):
              persona.scratch.relevance_w*relevance_out[key]*1, 
              persona.scratch.importance_w*importance_out[key]*1)
 
+    # C2.5 evidence-aware retrieval (guide 7.4): +2 steps on top of the GA
+    # recency+importance+relevance score -- economic_relevance_rerank +
+    # contradiction_filter. Guarded + identity when the flag/economy is off, so
+    # C1/C2/baseline retrieval is byte-for-byte unchanged. Internal cognition.
+    try:
+      from scaffolding import conditions, retrieval
+      if conditions.retrieval_rerank_on():
+        from economy.manager import current_econ_context
+        ctx = current_econ_context(persona.name)
+        if ctx:
+          ctx = dict(ctx)
+          _fl = focal_pt.lower()
+          ctx["goal_resources"] = [r for r in retrieval.typed_memory._RESOURCES
+                                   if r in _fl]
+        master_out, _dropped = retrieval.apply_rerank(
+            master_out, persona.a_mem.id_to_node, ctx)
+    except Exception:
+      pass
+
     # Extracting the highest x values.
-    # <master_out> has the key of node.id and value of float. Once we get the 
+    # <master_out> has the key of node.id and value of float. Once we get the
     # highest x values, we want to translate the node.id into nodes and return
     # the list of nodes.
     master_out = top_highest_x_values(master_out, n_count)

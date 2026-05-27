@@ -156,6 +156,38 @@ def execute(persona, maze, personas, plan):
   description += f" @ {persona.scratch.act_address}"
 
   execution = ret, persona.scratch.act_pronunciatio, description
+
+  # Telemetry (P2): the executed action + resulting tile is observable
+  # behavior -> raw/actions (evaluator-readable).
+  try:
+    import telemetry_log
+    telemetry_log.log_event("actions", {
+        "stage": "execute", "persona": persona.name,
+        "tile": list(ret) if isinstance(ret, (list, tuple)) else ret,
+        "act_address": persona.scratch.act_address,
+        "pronunciatio": persona.scratch.act_pronunciatio,
+        "description": description})
+  except Exception:
+    pass
+
+  # C2.5 typed action API (guide 7.9): additionally emit a structured action
+  # record to raw/actions so post-hoc reconstruction has action_type / location
+  # / pre,post_state_hash. Purely additive (no control-flow change); guarded by
+  # the typed_action flag; strategy_id stays None until C3 binds it.
+  try:
+    from scaffolding import conditions
+    if conditions.typed_action_on():
+      from scaffolding import action_api
+      from economy.manager import current_econ_context
+      a_type = "converse" if "<persona>" in plan else "move"
+      rec = action_api.record_ga_action(
+          persona.name, a_type, persona.scratch.act_address,
+          current_econ_context(persona.name), description=description)
+      import telemetry_log
+      telemetry_log.log_event("actions", dict(rec, stage="typed_action"))
+  except Exception:
+    pass
+
   return execution
 
 

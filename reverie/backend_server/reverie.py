@@ -35,6 +35,18 @@ from utils import *
 from maze import *
 from persona.persona import *
 
+try:
+  import telemetry_log
+except Exception:
+  telemetry_log = None
+
+try:
+  from economy import EconomyManager, economy_enabled
+except Exception:
+  EconomyManager = None
+  def economy_enabled():
+    return False
+
 ##############################################################################
 #                                  REVERIE                                   #
 ##############################################################################
@@ -54,11 +66,64 @@ class ReverieServer:
     # copy everything that's in <fork_sim_code>, but edit its 
     # reverie/meta/json's fork variable. 
     self.sim_code = sim_code
+    if telemetry_log is not None:
+      telemetry_log.set_run(self.sim_code)
+    # P3: optional background economy (off unless GA_ECONOMY=1). Decoupled from
+    # GA agent code; agents do not perceive it yet (option A).
+    self.economy = (EconomyManager()
+                    if (EconomyManager is not None and economy_enabled())
+                    else None)
+    # P7: when economy is on, optionally attach a frozen EnvironmentModel
+    # (GA_ENV_CONFIG -> signal/causal layer + de-semanticized resources) and a
+    # shock schedule (GA_SHOCK_CONFIG). Both default off -> pure P3 behavior.
+    # The de-semanticized transfer test sets GA_ENV_CONFIG=.../transfer_desem.json
+    # so the economic surface (perception + econ_decision) uses abstract goods.
+    if self.economy is not None:
+      try:
+        from economy import manager as _econ_mgr
+        env_cfg = os.environ.get("GA_ENV_CONFIG")
+        if env_cfg:
+          _m = _econ_mgr.load_env_config(env_cfg)
+          print(f"[economy] env model: {getattr(_m, 'env_id', None)} "
+                f"(desem={getattr(_m, 'desemanticized', None)}, "
+                f"resources={getattr(_m, 'resources', None)})")
+        shock_cfg = os.environ.get("GA_SHOCK_CONFIG")
+        if shock_cfg:
+          from economy import schedule as _econ_sched
+          _econ_mgr.set_shock_schedule(_econ_sched.load_shock_schedule(shock_cfg))
+          print(f"[economy] shock schedule attached: {shock_cfg}")
+      except Exception as _e:
+        print(f"[economy] env/shock attach skipped: {_e}")
     sim_folder = f"{fs_storage}/{self.sim_code}"
+    # If target simulation folder already exists due to a prior failed run,
+    # remove the stale folder before forking again. If movement data exists,
+    # treat it as an existing simulation and ask user to choose a new name.
+    if os.path.exists(sim_folder):
+      movement_folder = f"{sim_folder}/movement"
+      if os.path.exists(movement_folder):
+        raise FileExistsError(
+          f"Simulation '{self.sim_code}' already exists with movement data. "
+          f"Please choose a new simulation name."
+        )
+      shutil.rmtree(sim_folder)
     copyanything(fork_folder, sim_folder)
 
     with open(f"{sim_folder}/reverie/meta.json") as json_file:  
       reverie_meta = json.load(json_file)
+
+    persona_filter = os.getenv("GA_PERSONA_FILTER", "").strip()
+    if persona_filter:
+      requested_personas = [i.strip() for i in persona_filter.split(",")
+                            if i.strip()]
+      known_personas = set(reverie_meta["persona_names"])
+      unknown_personas = [i for i in requested_personas
+                          if i not in known_personas]
+      if unknown_personas:
+        raise ValueError(
+          f"GA_PERSONA_FILTER contains unknown personas: {unknown_personas}"
+        )
+      reverie_meta["persona_names"] = requested_personas
+      print(f"[DEBUG] GA_PERSONA_FILTER={requested_personas}")
 
     with open(f"{sim_folder}/reverie/meta.json", "w") as outfile: 
       reverie_meta["fork_sim_code"] = fork_sim_code
@@ -126,6 +191,16 @@ class ReverieServer:
       p_x = init_env[persona_name]["x"]
       p_y = init_env[persona_name]["y"]
       curr_persona = Persona(persona_name, persona_folder)
+      # P7/P11: optionally strip occupational priors for the de-semanticized
+      # transfer test (GA_NEUTRAL_PERSONAS=1). Default off -> baseline faithful.
+      try:
+        from scaffolding import neutral_persona as _np
+        if _np.neutral_personas_on():
+          _ch = _np.neutralize_persona(curr_persona)
+          if _ch:
+            print(f"[neutral-persona] {persona_name}: stripped {_ch}")
+      except Exception as _e:
+        print(f"[neutral-persona] skipped for {persona_name}: {_e}")
 
       self.personas[persona_name] = curr_persona
       self.personas_tile[persona_name] = (p_x, p_y)
@@ -367,8 +442,42 @@ class ReverieServer:
           # Then we need to actually have each of the personas perceive and
           # move. The movement for each of the personas comes in the form of
           # x y coordinates where the persona will move towards. e.g., (50, 34)
-          # This is where the core brains of the personas are invoked. 
-          movements = {"persona": dict(), 
+          # This is where the core brains of the personas are invoked.
+          if telemetry_log is not None:
+            telemetry_log.set_step(self.step, self.curr_time)
+          # C2: refresh economic perception BEFORE personas plan, so daily-plan
+          # prompts can read it. No-op if economy disabled.
+          if self.economy is not None:
+            self.economy.stamp_perception(self.personas, self.curr_time)
+
+          # Economic action loop (substrate, economic-action-loop.md): once per
+          # game day, typed-action conditions (C1/C2.5/C3/C4 -- NOT C2) let each
+          # agent make a structured trade decision that actually moves cash /
+          # inventory. Guarded; no-op if economy off or condition lacks typed
+          # actions. Fires on the first step of each game day (incl. day 0).
+          try:
+            from scaffolding import conditions
+            if self.economy is not None and conditions.typed_action_on():
+              _today = self.curr_time.date()
+              if getattr(self, "_econ_decision_day", None) != _today:
+                self._econ_decision_day = _today
+                from scaffolding import econ_decision
+                _strat_on = conditions.strategy_on()
+                _strat = None
+                if _strat_on:
+                  from scaffolding import strategy as _strat
+                for _pn in self.personas:
+                  # C3: propose/select a strategy first (before trading), then
+                  # bind the day's trades to it (agent_internal only).
+                  _sid = (_strat.run_daily_strategy(_pn, self.economy,
+                          self.curr_time) if _strat_on else None)
+                  econ_decision.run_daily_decision(_pn, self.economy,
+                                                   self.curr_time,
+                                                   bind_strategy_id=_sid)
+          except Exception:
+            pass
+
+          movements = {"persona": dict(),
                        "meta": dict()}
           for persona_name, persona in self.personas.items(): 
             # <next_tile> is a x,y coordinate. e.g., (58, 9)
@@ -398,10 +507,33 @@ class ReverieServer:
           #  "persona": {"Klaus Mueller": {"movement": [38, 12]}}, 
           #  "meta": {curr_time: <datetime>}}
           curr_move_file = f"{sim_folder}/movement/{self.step}.json"
-          with open(curr_move_file, "w") as outfile: 
+          # Some base simulations do not track empty `movement/` folders in git.
+          # Ensure the destination directory exists before writing step files.
+          create_folder_if_not_there(curr_move_file)
+          with open(curr_move_file, "w") as outfile:
             outfile.write(json.dumps(movements, indent=2))
 
-          # After this cycle, the world takes one step forward, and the 
+          # Telemetry (P2): authoritative per-step world_state + dialogue snapshot
+          # (observable behavior -> raw/). Refresh the cost summary every step so a
+          # killed/timed-out run still leaves partial token totals on disk.
+          if telemetry_log is not None:
+            for _pname, _pdata in movements["persona"].items():
+              telemetry_log.log_event("world_state", {
+                  "persona": _pname,
+                  "tile": _pdata.get("movement"),
+                  "pronunciatio": _pdata.get("pronunciatio"),
+                  "description": _pdata.get("description")})
+              if _pdata.get("chat"):
+                telemetry_log.log_event("dialogue", {
+                    "persona": _pname, "chat": _pdata.get("chat")})
+            telemetry_log.dump_cost_summary()
+
+          # P3: settle the background economy for this step (income / daily
+          # expense / bankruptcy), logged to raw/economy.jsonl. No-op if disabled.
+          if self.economy is not None:
+            self.economy.step(self.personas, self.curr_time, self.sec_per_step)
+
+          # After this cycle, the world takes one step forward, and the
           # current time moves by <sec_per_step> amount. 
           self.step += 1
           self.curr_time += datetime.timedelta(seconds=self.sec_per_step)
@@ -604,6 +736,12 @@ if __name__ == '__main__':
   # rs = ReverieServer("July1_the_ville_isabella_maria_klaus-step-3-20", 
   #                    "July1_the_ville_isabella_maria_klaus-step-3-21")
   # rs.open_server()
+
+  # Print active LLM/network configuration at startup for quick verification.
+  print("[LLM CONFIG]")
+  print(f"provider={llm_provider}")
+  print(f"api_base={llm_api_base}")
+  print(f"proxy={llm_proxy if llm_proxy else 'disabled'}")
 
   origin = input("Enter the name of the forked simulation: ").strip()
   target = input("Enter the name of the new simulation: ").strip()
