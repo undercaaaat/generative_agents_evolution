@@ -7,7 +7,9 @@ Description: Wrapper functions for calling OpenAI APIs.
 import json
 import random
 import openai
-import time 
+import os
+import time
+import concurrent.futures as _futures
 
 from utils import *
 
@@ -20,12 +22,49 @@ openai.api_key = openai_api_key
 openai.api_base = llm_api_base
 openai.proxy = apply_network_proxy()
 
+# Layer 1: wall-clock timeout enforced by a worker thread, independent of
+# openai 0.27's `request_timeout`. The library's timeout misses pooled-stale
+# sockets when the proxy half-closes (observed 2026-05-29: 5 sims hung 30+ min
+# on reads from urllib3-pooled connections after 127.0.0.1:7890 hiccuped).
+# We hard-cap each create() at GA_LLM_WALL_TIMEOUT seconds (default 90).
+_WALL_TIMEOUT = float(os.environ.get("GA_LLM_WALL_TIMEOUT", "90"))
+_WALL_EXECUTOR = _futures.ThreadPoolExecutor(max_workers=4,
+                                             thread_name_prefix="llm-wall")
+
+
+def _call_with_wall_timeout(fn, *args, **kwargs):
+  """Run `fn(*args, **kwargs)` in a worker, raise TimeoutError after
+  _WALL_TIMEOUT seconds. The hung worker may leak (we cannot cancel a blocked
+  socket read), but the caller is unblocked and can retry."""
+  fut = _WALL_EXECUTOR.submit(fn, *args, **kwargs)
+  try:
+    return fut.result(timeout=_WALL_TIMEOUT)
+  except _futures.TimeoutError:
+    raise TimeoutError(
+        f"openai call exceeded wall timeout {_WALL_TIMEOUT}s")
+
 _LEGACY_COMPLETION_ENGINES = ("text-davinci-002", "text-davinci-003")
 _API_ERROR_PREFIXES = ("GPT REQUEST ERROR", "ChatGPT ERROR")
 
 
+# Module-level "last successful LLM call" timestamp. Read by the reverie
+# step-watchdog (Layer 2) so it treats any successful API roundtrip as
+# evidence of progress -- otherwise frame-0 (which has many LLM calls but
+# no step increment for ~15-25 min wall-clock) trips the watchdog falsely.
+_LAST_LLM_OK_TS = [time.time()]
+
+
+def get_last_llm_ok_ts():
+  return _LAST_LLM_OK_TS[0]
+
+
+def _mark_llm_progress():
+  _LAST_LLM_OK_TS[0] = time.time()
+
+
 def _meter(call_type, model, response):
   """Record token usage from an API response. Side-effect-free; never raises."""
+  _mark_llm_progress()
   if telemetry_log is None:
     return
   try:
@@ -60,7 +99,7 @@ def _chat_completion_create(model, messages, **kwargs):
   headers = get_openrouter_headers()
   if headers:
     kwargs["headers"] = headers
-  response = openai.ChatCompletion.create(**kwargs)
+  response = _call_with_wall_timeout(openai.ChatCompletion.create, **kwargs)
   _meter("chat", model, response)
   return response
 
@@ -70,7 +109,7 @@ def _completion_create(**kwargs):
   headers = get_openrouter_headers()
   if headers:
     kwargs["headers"] = headers
-  response = openai.Completion.create(**kwargs)
+  response = _call_with_wall_timeout(openai.Completion.create, **kwargs)
   _meter("completion", kwargs.get("model"), response)
   return response
 
@@ -80,7 +119,7 @@ def _embedding_create(input, model):
   headers = get_openrouter_headers()
   if headers:
     kwargs["headers"] = headers
-  response = openai.Embedding.create(**kwargs)
+  response = _call_with_wall_timeout(openai.Embedding.create, **kwargs)
   _meter("embedding", model, response)
   return response
 

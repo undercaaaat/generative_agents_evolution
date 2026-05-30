@@ -1,4 +1,5 @@
 reverie/backend_server/utils.py
+reverie/backend_server/.env.local
 frontend_server/settings/local.py
 storage/*
 static_dirs/*

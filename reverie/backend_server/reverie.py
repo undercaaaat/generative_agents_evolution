@@ -26,6 +26,8 @@ import time
 import math
 import os
 import shutil
+import sys
+import threading
 import traceback
 
 from selenium import webdriver
@@ -95,18 +97,30 @@ class ReverieServer:
       except Exception as _e:
         print(f"[economy] env/shock attach skipped: {_e}")
     sim_folder = f"{fs_storage}/{self.sim_code}"
-    # If target simulation folder already exists due to a prior failed run,
-    # remove the stale folder before forking again. If movement data exists,
-    # treat it as an existing simulation and ask user to choose a new name.
-    if os.path.exists(sim_folder):
-      movement_folder = f"{sim_folder}/movement"
-      if os.path.exists(movement_folder):
-        raise FileExistsError(
-          f"Simulation '{self.sim_code}' already exists with movement data. "
-          f"Please choose a new simulation name."
-        )
-      shutil.rmtree(sim_folder)
-    copyanything(fork_folder, sim_folder)
+    # Layer 3: resume mode. When GA_RESUME_FROM is set to this sim_code, we
+    # adopt the existing sim folder instead of copying the fork. The Persona
+    # class loads each persona's bootstrap_memory/ (which auto-save writes
+    # to), so picking up mid-run "just works" if the folder is intact.
+    resume_from = os.environ.get("GA_RESUME_FROM", "").strip()
+    resuming = bool(resume_from) and resume_from == self.sim_code \
+               and os.path.exists(f"{sim_folder}/reverie/meta.json")
+    if resuming:
+      print(f"[resume] adopting existing sim '{self.sim_code}' "
+            f"(fork '{fork_sim_code}' arg ignored)", flush=True)
+    else:
+      # If target simulation folder already exists due to a prior failed run,
+      # remove the stale folder before forking again. If movement data exists,
+      # treat it as an existing simulation and ask user to choose a new name.
+      if os.path.exists(sim_folder):
+        movement_folder = f"{sim_folder}/movement"
+        if os.path.exists(movement_folder):
+          raise FileExistsError(
+            f"Simulation '{self.sim_code}' already exists with movement data. "
+            f"Please choose a new simulation name."
+          )
+        shutil.rmtree(sim_folder)
+      copyanything(fork_folder, sim_folder)
+    self._resuming = resuming
 
     with open(f"{sim_folder}/reverie/meta.json") as json_file:  
       reverie_meta = json.load(json_file)
@@ -155,8 +169,20 @@ class ReverieServer:
     
     # <step> denotes the number of steps that our game has taken. A step here
     # literally translates to the number of moves our personas made in terms
-    # of the number of tiles. 
+    # of the number of tiles.
     self.step = reverie_meta['step']
+
+    # Layer 2: step-level watchdog. If `GA_STEP_WATCHDOG` seconds pass with
+    # no successful step progress, the daemon kills the process so a
+    # supervisor can restart. Defaults: enabled, 600s (10 min). Set
+    # GA_STEP_WATCHDOG=0 to disable.
+    self._last_step_progress_ts = time.time()
+    self._watchdog_stop = threading.Event()
+    self._watchdog_thread = None
+    try:
+      self._watchdog_timeout = float(os.environ.get("GA_STEP_WATCHDOG", "600"))
+    except ValueError:
+      self._watchdog_timeout = 600.0
 
     # SETTING UP PERSONAS IN REVERIE
     # <personas> is a dictionary that takes the persona's full name as its 
@@ -229,10 +255,67 @@ class ReverieServer:
       outfile.write(json.dumps(curr_step, indent=2))
 
 
-  def save(self): 
+  # ----- Layer 2: step-level watchdog ------------------------------------
+  def _watchdog_loop(self):
+    """Daemon: if no progress in `_watchdog_timeout` seconds, print stack
+    traces, save what we can, and force-exit with code 2 so the supervisor
+    can restart (Layer 3 handles resume). "Progress" = either a step
+    completed OR a successful LLM call (so frame-0's long single step,
+    which has many LLM calls but no step increment for ~15-25 min, does
+    not trigger a false abort)."""
+    try:
+      from persona.prompt_template import gpt_structure as _gs
+      _llm_clock = _gs.get_last_llm_ok_ts
+    except Exception:
+      _llm_clock = lambda: 0.0
+    poll_every = max(5.0, self._watchdog_timeout / 20.0)
+    while not self._watchdog_stop.wait(poll_every):
+      progress_ts = max(self._last_step_progress_ts, _llm_clock())
+      gap = time.time() - progress_ts
+      if gap < self._watchdog_timeout:
+        continue
+      print(f"\n[WATCHDOG] no step progress for {gap:.0f}s "
+            f"(threshold {self._watchdog_timeout:.0f}s) -- aborting.",
+            flush=True)
+      # Dump all thread stacks for post-mortem of the stuck call.
+      for tid, frame in sys._current_frames().items():
+        print(f"[WATCHDOG] thread {tid} stack:", flush=True)
+        traceback.print_stack(frame)
+      try:
+        self.save()
+        print("[WATCHDOG] save() ok", flush=True)
+      except Exception as e:
+        print(f"[WATCHDOG] save() failed: {e!r}", flush=True)
+      # os._exit skips finally/atexit; that is intentional -- the hung
+      # openai worker thread cannot be cancelled cleanly.
+      os._exit(2)
+
+  def _watchdog_start(self):
+    if self._watchdog_timeout <= 0:
+      print("[WATCHDOG] disabled (GA_STEP_WATCHDOG<=0)", flush=True)
+      return
+    self._watchdog_stop.clear()
+    self._last_step_progress_ts = time.time()
+    t = threading.Thread(target=self._watchdog_loop,
+                         name="step-watchdog", daemon=True)
+    t.start()
+    self._watchdog_thread = t
+    print(f"[WATCHDOG] armed: threshold={self._watchdog_timeout:.0f}s",
+          flush=True)
+
+  def _watchdog_stop_thread(self):
+    if self._watchdog_thread is not None:
+      self._watchdog_stop.set()
+      self._watchdog_thread = None
+
+  def _watchdog_heartbeat(self):
+    """Call after each successful step in start_server's main loop."""
+    self._last_step_progress_ts = time.time()
+
+  def save(self):
     """
     Save all Reverie progress -- this includes Reverie's global state as well
-    as all the personas.  
+    as all the personas.
 
     INPUT
       None
@@ -366,6 +449,17 @@ class ReverieServer:
     """
     # <sim_folder> points to the current simulation folder.
     sim_folder = f"{fs_storage}/{self.sim_code}"
+
+    # Layer 3: auto-save cadence. Save every GA_AUTOSAVE_EVERY successful
+    # steps so a watchdog-abort or crash loses at most that many steps. Set
+    # 0 to disable. Default 300 steps = 50 min game time / a few min wall.
+    try:
+      self._autosave_every = int(os.environ.get("GA_AUTOSAVE_EVERY", "300"))
+    except ValueError:
+      self._autosave_every = 300
+
+    # Layer 2: arm step-level watchdog for the duration of this run.
+    self._watchdog_start()
 
     # When a persona arrives at a game object, we give a unique event
     # to that object. 
@@ -534,17 +628,33 @@ class ReverieServer:
             self.economy.step(self.personas, self.curr_time, self.sec_per_step)
 
           # After this cycle, the world takes one step forward, and the
-          # current time moves by <sec_per_step> amount. 
+          # current time moves by <sec_per_step> amount.
           self.step += 1
           self.curr_time += datetime.timedelta(seconds=self.sec_per_step)
+          self._watchdog_heartbeat()
+
+          # Layer 3: auto-save every N successful steps so resume after a
+          # crash loses at most that many steps. Guarded so a save failure
+          # never breaks the loop.
+          if self._autosave_every > 0 \
+              and self.step % self._autosave_every == 0:
+            try:
+              self.save()
+              print(f"[autosave] step={self.step} ok", flush=True)
+            except Exception as _e:
+              print(f"[autosave] step={self.step} FAILED: {_e!r}", flush=True)
 
           int_counter -= 1
-          
-      # Sleep so we don't burn our machines. 
+
+      # Sleep so we don't burn our machines.
       time.sleep(self.server_sleep)
 
+    # Normal exit -- stop the watchdog so we do not kill the process
+    # while idle at the "Enter option:" prompt.
+    self._watchdog_stop_thread()
 
-  def open_server(self): 
+
+  def open_server(self):
     """
     Open up an interactive terminal prompt that lets you run the simulation 
     step by step and probe agent state. 
