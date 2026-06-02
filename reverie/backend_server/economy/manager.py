@@ -168,6 +168,12 @@ class EconomyManager:
     di = self._curr_day_index if day_index is None else day_index
     return _PHASES.phase_for(di) if _PHASES is not None else None
 
+  def wage_multiplier(self, day_index=None):
+    """Wage scaling from a registered wage_cut shock on a given day (default
+    1.0 with no shocks attached -> byte-for-byte P3 wage behavior)."""
+    di = self._curr_day_index if day_index is None else day_index
+    return _SHOCKS.wage_multiplier(di) if _SHOCKS is not None else 1.0
+
   def price(self, resource, day_index=None):
     """Market unit price of a resource on a given day. Layers (all deterministic):
       1. base: env-model base price if attached, else config PRICES;
@@ -251,7 +257,7 @@ class EconomyManager:
     if s["bankrupt"]:
       pass  # bankrupt agents can still earn their way back out
     if self._is_working(name, act_description, act_address, hour):
-      wage = self.cfg.job_for(name)["wage_per_hour"]
+      wage = self.cfg.job_for(name)["wage_per_hour"] * self.wage_multiplier()
       earned = wage * (float(step_seconds) / 3600.0)
       s["cash"] += earned
       s["income_today"] += earned

@@ -142,7 +142,14 @@ def apply_trade(manager, agent_id, item, quantity, side, *, location=None,
   post = state_subset(manager, agent_id, location=location)
   price = None
   try:
-    price = manager.cfg.PRICES.get(item) if manager else None
+    # Log the price the trade actually executed at (manager.price() applies the
+    # current-day env-model / phase wave / shock multiplier), not the static
+    # base price. The day has not advanced since manager.trade() above, so this
+    # is the same unit price that trade() charged. Fall back to base only if the
+    # resource is inactive today (price() -> None).
+    price = manager.price(item) if manager else None
+    if price is None:
+      price = manager.cfg.PRICES.get(item) if manager else None
   except Exception:
     price = None
   rec = build_action(

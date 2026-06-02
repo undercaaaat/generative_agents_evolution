@@ -67,6 +67,16 @@ class ShockSchedule:
         return False
     return True
 
+  def wage_multiplier(self, day_index):
+    """Deterministic wage multiplier from active wage_cut shocks. Resource-
+    independent (cuts the stable income source for all agents), so net worth has
+    to be defended by trading. Default (no wage_cut active) -> 1.0."""
+    mult = 1.0
+    for s in self.active_shocks(day_index):
+      if s.get("type") == "wage_cut":
+        mult *= (1.0 - float(s.get("magnitude_pct", 0)) / 100.0)
+    return round(max(0.0, mult), 6)
+
 
 def load_phase_schedule(path):
   with open(path, "r", encoding="utf-8") as f:
@@ -112,6 +122,16 @@ def _selftest():
   check(sh.is_available("coffee", 27) is True, "coffee buyable after closure (24+3)")
   check(abs(sh.price_multiplier("food", 31) - 0.60) < 1e-9, "food -40% during demand drop")
   check(sh.price_multiplier("food", 34) == 1.0, "demand shift ends day 34")
+
+  shw = ShockSchedule([
+      {"shock_id": "w", "type": "wage_cut", "start_day": 14, "duration_days": 4,
+       "magnitude_pct": 80},
+  ])
+  check(shw.wage_multiplier(13) == 1.0, "no wage cut before day 14")
+  check(abs(shw.wage_multiplier(14) - 0.20) < 1e-9, "wage at 20% during cut")
+  check(abs(shw.wage_multiplier(17) - 0.20) < 1e-9, "wage cut lasts 4 days")
+  check(shw.wage_multiplier(18) == 1.0, "wage restored day 18")
+  check(sh.wage_multiplier(14) == 1.0, "price/closure shocks do not touch wage")
 
   print("schedule selftest: ALL PASS" if ok else "schedule selftest: FAILED")
   return ok
