@@ -28,7 +28,8 @@ if _BACKEND not in sys.path:
 
 try:
   from economy import config as _econ_config
-  _RESOURCES = [r.lower() for r in _econ_config.RESOURCES]
+  # Include phase-scheduled resources such as tool, not only day-0 resources.
+  _RESOURCES = [r.lower() for r in _econ_config.PRICES]
 except Exception:
   _RESOURCES = []
 

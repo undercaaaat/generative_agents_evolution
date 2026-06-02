@@ -26,7 +26,8 @@ in the transfer arena like the LLM conditions.
 
 CLI:
   python scaffolding/scripted_baseline.py --sim c5-demo --agents 4 --days 12 --seed 7
-  # optional: --env <transfer_desem.json> --shock <shock_events.json>
+  # optional: --env <train_semantic.json> --shock <shock_events.json>
+  #           --phase <phase_scheduler.json>
 """
 import argparse
 import os
@@ -54,8 +55,7 @@ _BASE_DATE = datetime(2023, 2, 13)  # day index 0 (matches GA base sim date)
 
 
 def _resources(manager):
-  m = econ_mgr.get_env_model()
-  return list(m.resources) if (m is not None and m.resources) else list(manager.cfg.RESOURCES)
+  return list(manager._resources())
 
 
 def _networth(manager, name, resources, day):
@@ -84,13 +84,18 @@ class _ScriptedAgent:
       self.current = max(sorted(self.fitness), key=lambda k: self.fitness[k])
     return self.current.replace("trade_", "")
 
+  def add_resources(self, resources):
+    for r in resources:
+      self.fitness.setdefault(f"trade_{r}", 0.0)
+
   def update_fitness(self, strat, delta):
     self.fitness[strat] = ((1 - _FITNESS_DECAY) * self.fitness[strat]
                            + _FITNESS_DECAY * delta)
 
 
 def run_scripted_sim(sim_code, n_agents=4, n_days=12, seed=7,
-                     env_config=None, shock_config=None, env_model=None):
+                     env_config=None, shock_config=None, env_model=None,
+                     phase_config=None):
   import random
   rng = random.Random(seed)
 
@@ -103,9 +108,15 @@ def run_scripted_sim(sim_code, n_agents=4, n_days=12, seed=7,
   if shock_config:
     from economy import schedule
     econ_mgr.set_shock_schedule(schedule.load_shock_schedule(shock_config))
+  if phase_config:
+    from economy import schedule
+    econ_mgr.set_phase_schedule(schedule.load_phase_schedule(phase_config))
 
   manager = econ_mgr.EconomyManager()
   if telemetry_log is not None:
+    # C5 is cheap and deterministic rather than resumable. If a prior attempt
+    # stopped mid-run, rebuild its semantic logs from scratch before rerunning.
+    telemetry_log.clear_run_logs(sim_code)
     telemetry_log.set_run(sim_code)
 
   resources = _resources(manager)
@@ -118,6 +129,11 @@ def run_scripted_sim(sim_code, n_agents=4, n_days=12, seed=7,
   for day in range(n_days):
     curr = _BASE_DATE + timedelta(days=day)
     manager._set_day(curr)
+    resources = _resources(manager)
+    for ag in agents:
+      ag.add_resources(resources)
+    for n in names:
+      manager.ensure_agent(n)
     if telemetry_log is not None:
       telemetry_log.set_step(day, curr)
 
@@ -149,12 +165,12 @@ def run_scripted_sim(sim_code, n_agents=4, n_days=12, seed=7,
     # imitation on a ring: agent i meets agent (i+1).
     for i, ag in enumerate(agents):
       nb = agents[(i + 1) % len(agents)]
+      nb_best = max(sorted(nb.fitness), key=lambda k: nb.fitness[k])
       if telemetry_log is not None:   # contact is observable -> raw/dialogue
         telemetry_log.log_event("dialogue", {
-            "persona": ag.name, "target_agent": nb.name,
-            "utterance": "(scripted contact)"})
+            "persona": nb.name, "target_agent": ag.name,
+            "utterance": f"I recommend trading {nb_best.replace('trade_', '')}."})
       if ag.rng.random() < P_IMITATE:
-        nb_best = max(sorted(nb.fitness), key=lambda k: nb.fitness[k])
         # copy neighbour's best strategy: boost it in own table.
         ag.fitness[nb_best] = max(ag.fitness[nb_best], nb.fitness[nb_best])
         if telemetry_log is not None:
@@ -170,6 +186,9 @@ def run_scripted_sim(sim_code, n_agents=4, n_days=12, seed=7,
 
   econ_mgr.set_env_model(None)
   econ_mgr.set_shock_schedule(None)
+  econ_mgr.set_phase_schedule(None)
+  if telemetry_log is not None:
+    telemetry_log.dump_cost_summary()
   return manager
 
 
@@ -228,11 +247,13 @@ def main():
   ap.add_argument("--seed", type=int, default=7)
   ap.add_argument("--env", default=None)
   ap.add_argument("--shock", default=None)
+  ap.add_argument("--phase", default=None)
   ap.add_argument("--selftest", action="store_true")
   a = ap.parse_args()
   if a.selftest:
     sys.exit(0 if _selftest() else 1)
-  run_scripted_sim(a.sim, a.agents, a.days, a.seed, a.env, a.shock)
+  run_scripted_sim(a.sim, a.agents, a.days, a.seed, a.env, a.shock,
+                   phase_config=a.phase)
   print(f"scripted C5 run '{a.sim}': {a.agents} agents x {a.days} days "
         f"-> 05-telemetry/raw/{a.sim}/")
 

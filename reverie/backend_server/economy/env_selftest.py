@@ -71,7 +71,7 @@ def main():
       print(f"    decoy FAIL: {decoy} does not vary (levels={levels})"); decoy_ok = False
   section("false-cue decoy signal (varies, drives nothing)", decoy_ok)
 
-  # 4. Wiring into EconomyManager + default-off regression guard.
+  # 4. Wiring into EconomyManager + phase boundaries + default-off guard.
   wire_ok = True
   m = signals.load_env(os.path.join(_CFG, "transfer-envs", "transfer_desem.json"))
   manager.set_env_model(m)
@@ -85,11 +85,28 @@ def main():
   wire_ok = wire_ok and (em.trade("A", "alpha_good", 1, "buy") is False)
   manager.set_env_model(None)
   manager.set_shock_schedule(None)
+  # Frozen main schedule: phase 1 keeps prices flat, phase 2 enables signals,
+  # and phase 3 exposes the new tradable tool resource.
+  train = signals.load_env(os.path.join(_CFG, "transfer-envs", "train_semantic.json"))
+  phases = schedule.load_phase_schedule(os.path.join(_CFG, "phase_scheduler.json"))
+  manager.set_env_model(train)
+  manager.set_phase_schedule(phases)
+  em_phase = manager.EconomyManager()
+  em_phase._curr_day_index = 0
+  em_phase.ensure_agent("B")
+  wire_ok = wire_ok and (em_phase.price("coffee", day_index=0) == 3.0)
+  wire_ok = wire_ok and (em_phase.price("tool", day_index=19) is None)
+  wire_ok = wire_ok and (em_phase.price("tool", day_index=20) == 4.0)
+  em_phase._curr_day_index = 20
+  em_phase.ensure_agent("B")
+  wire_ok = wire_ok and ("tool" in em_phase.states["B"]["inventory"])
+  manager.set_env_model(None)
+  manager.set_phase_schedule(None)
   # Default-off regression: plain config behavior restored.
   em2 = manager.EconomyManager()
   wire_ok = wire_ok and (em2._resources() == em2.cfg.RESOURCES)
   wire_ok = wire_ok and (em2.price("coffee") == em2.cfg.PRICES["coffee"])
-  section("env-model + shock wiring into manager (+ default-off guard)", wire_ok)
+  section("env + shock + phase wiring into manager (+ default-off guard)", wire_ok)
 
   # 5. Loophole adversarial probe.
   section("loophole adversarial check", loophole_check.main() == 0)

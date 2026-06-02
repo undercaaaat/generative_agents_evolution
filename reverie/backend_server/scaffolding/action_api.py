@@ -44,6 +44,23 @@ def new_action_id():
   return f"a_{next(_ids)}"
 
 
+def checkpoint_state():
+  """Return the next action-id integer without consuming it."""
+  try:
+    return {"next_id": int(_ids.__reduce__()[1][0])}
+  except Exception:
+    return {"next_id": 1}
+
+
+def restore_checkpoint_state(state):
+  """Restore the next action-id integer after an interrupted run."""
+  global _ids
+  try:
+    _ids = itertools.count(max(1, int((state or {}).get("next_id", 1))))
+  except Exception:
+    _ids = itertools.count(1)
+
+
 def _agent_state(manager, name):
   """Action-relevant economic slice for one agent, or None if no economy."""
   if manager is None or name is None:

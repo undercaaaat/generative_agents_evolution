@@ -24,6 +24,9 @@ PRICES = {                    # base market unit price (buy == sell, no spread)
     "food": 5.0,
     "coffee": 3.0,
     "ingredients": 2.0,
+    # Activated by phase_scheduler.json on day 20. Kept out of RESOURCES so
+    # default-off P3 behavior remains the original three-good economy.
+    "tool": 4.0,
 }
 
 # --- minimal price dynamics (economic-action-loop.md 6; pulled forward from P7) ---
@@ -41,6 +44,7 @@ PRICE_WAVE_PHASE = {          # per-resource phase offset (days) so they desync
     "food": 0,
     "coffee": 1,
     "ingredients": 2,
+    "tool": 3,
 }
 
 # --- jobs (income, guide 5.3 first tier: fixed/temp work) ---

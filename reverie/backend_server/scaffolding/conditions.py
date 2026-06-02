@@ -12,6 +12,11 @@ Design table (C2.5-typed-scaffolding.md 7):
   C3   : C2.5 + strategy
   C4   : C3  + transmission
 
+Pre-registered sensitivity axis:
+  C2.75 is NOT another preset or a seventh sequential causal condition.
+  It is the C2.5/C3 robustness rerun selected with GA_RETRIEVAL_MODE=embed.
+  The primary ladder continues to use GA_RETRIEVAL_MODE=econ.
+
 Precedence: an explicitly-set individual flag overrides the condition preset
 (lets you probe one piece). GA_CONDITION unset -> all scaffolding off, i.e. the
 current validated C2-or-baseline behavior (defaults are safe).

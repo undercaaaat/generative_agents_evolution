@@ -21,6 +21,7 @@ Output layout:
       dialogue.jsonl     chats
       world_state.jsonl  positions / world facts (optional)
       llm_calls.jsonl    per-call token usage (ops channel, not an eval metric)
+      llm_errors.jsonl   categorized API failures (ops channel)
       cost_summary.json  per-run token totals by model
   <research_root>/05-telemetry/agent_internal/<sim_code>/
       retrieve.jsonl     which memories were retrieved (internal)
@@ -48,12 +49,57 @@ _INTERNAL_CHANNELS = {"retrieve", "reflect", "plan", "econ_decision", "strategy"
 
 _CTX = {"sim_code": "unknown_sim", "step": None, "curr_time": None}
 _COST = {}  # model -> {calls, prompt_tokens, completion_tokens, total_tokens}
+_ERRORS = {}  # category -> count
 _ENABLED = os.environ.get("GA_TELEMETRY", "1") not in ("0", "false", "False")
 
 
-def set_run(sim_code):
-  """Set the current simulation code (storage dir name)."""
-  _CTX["sim_code"] = sim_code or "unknown_sim"
+def _run_dir(base, sim_code):
+  return os.path.join(_TELEMETRY_ROOT, base, str(sim_code))
+
+
+def _ops_log(filename):
+  return filename in ("llm_calls.jsonl", "llm_errors.jsonl")
+
+
+def _hydrate_ops(sim_code):
+  """Rebuild aggregate ops counters from append-only logs on resume."""
+  raw = _run_dir("raw", sim_code)
+  calls_path = os.path.join(raw, "llm_calls.jsonl")
+  errors_path = os.path.join(raw, "llm_errors.jsonl")
+  try:
+    with open(calls_path, encoding="utf-8") as f:
+      for line in f:
+        row = json.loads(line)
+        model = row.get("model")
+        agg = _COST.setdefault(
+            model, {"calls": 0, "prompt_tokens": 0,
+                    "completion_tokens": 0, "total_tokens": 0})
+        agg["calls"] += 1
+        agg["prompt_tokens"] += int(row.get("prompt_tokens", 0) or 0)
+        agg["completion_tokens"] += int(row.get("completion_tokens", 0) or 0)
+        agg["total_tokens"] += int(row.get("total_tokens", 0) or 0)
+  except Exception:
+    pass
+  try:
+    with open(errors_path, encoding="utf-8") as f:
+      for line in f:
+        row = json.loads(line)
+        category = row.get("error_category", "unknown")
+        _ERRORS[category] = _ERRORS.get(category, 0) + 1
+  except Exception:
+    pass
+
+
+def set_run(sim_code, resume=False):
+  """Set the current simulation code and optionally hydrate prior ops logs."""
+  with _LOCK:
+    _CTX["sim_code"] = sim_code or "unknown_sim"
+    _CTX["step"] = None
+    _CTX["curr_time"] = None
+    _COST.clear()
+    _ERRORS.clear()
+    if resume:
+      _hydrate_ops(_CTX["sim_code"])
 
 
 def set_step(step, curr_time=None):
@@ -64,9 +110,71 @@ def set_step(step, curr_time=None):
 
 def _channel_dir(channel):
   base = "agent_internal" if channel in _INTERNAL_CHANNELS else "raw"
-  d = os.path.join(_TELEMETRY_ROOT, base, str(_CTX["sim_code"]))
+  d = _run_dir(base, _CTX["sim_code"])
   os.makedirs(d, exist_ok=True)
   return d
+
+
+def snapshot_offsets(sim_code=None):
+  """Capture semantic JSONL byte offsets at a checkpoint boundary."""
+  offsets = {}
+  try:
+    sim = sim_code or _CTX["sim_code"]
+    for base in ("raw", "agent_internal"):
+      root = _run_dir(base, sim)
+      if not os.path.isdir(root):
+        continue
+      for filename in os.listdir(root):
+        if not filename.endswith(".jsonl") or _ops_log(filename):
+          continue
+        path = os.path.join(root, filename)
+        if os.path.isfile(path):
+          offsets[f"{base}/{filename}"] = os.path.getsize(path)
+  except Exception:
+    pass
+  return offsets
+
+
+def restore_offsets(offsets, sim_code=None):
+  """Rollback semantic logs to a committed checkpoint; preserve ops logs."""
+  try:
+    sim = sim_code or _CTX["sim_code"]
+    offsets = offsets or {}
+    for base in ("raw", "agent_internal"):
+      root = _run_dir(base, sim)
+      if not os.path.isdir(root):
+        continue
+      for filename in os.listdir(root):
+        if not filename.endswith(".jsonl") or _ops_log(filename):
+          continue
+        path = os.path.join(root, filename)
+        if not os.path.isfile(path):
+          continue
+        size = max(0, int(offsets.get(f"{base}/{filename}", 0)))
+        with open(path, "r+b") as f:
+          f.truncate(size)
+    # A completion marker from a prior run must never survive a resume.
+    marker = os.path.join(_run_dir("raw", sim), "cost_summary.json")
+    if os.path.isfile(marker):
+      os.remove(marker)
+  except Exception:
+    pass
+
+
+def clear_run_logs(sim_code):
+  """Clear event logs for a deterministic fresh rerun such as C5."""
+  try:
+    for base in ("raw", "agent_internal"):
+      root = _run_dir(base, sim_code)
+      if not os.path.isdir(root):
+        continue
+      for filename in os.listdir(root):
+        if filename.endswith(".jsonl") or filename == "cost_summary.json":
+          path = os.path.join(root, filename)
+          if os.path.isfile(path):
+            os.remove(path)
+  except Exception:
+    pass
 
 
 def log_event(channel, record):
@@ -97,7 +205,7 @@ def log_event(channel, record):
     pass
 
 
-def record_llm_call(call_type, model, usage):
+def record_llm_call(call_type, model, usage, latency_s=None):
   """Accumulate token usage per model and append one line to llm_calls.jsonl.
 
   `usage` is the OpenAI/OpenRouter usage object (dict-like) or None. Never
@@ -122,8 +230,39 @@ def record_llm_call(call_type, model, usage):
       agg["completion_tokens"] += ct
       agg["total_tokens"] += tt
     log_event("llm_calls", {"call_type": call_type, "model": model,
+                            "ok": True, "latency_seconds": latency_s,
                             "prompt_tokens": pt, "completion_tokens": ct,
                             "total_tokens": tt})
+  except Exception:
+    pass
+
+
+def record_llm_error(call_type, model, error, latency_s=None):
+  """Append one ops-only failure row and aggregate a compact error category."""
+  if not _ENABLED:
+    return
+  try:
+    text = str(error)
+    low = text.lower()
+    if isinstance(error, TimeoutError) or "timeout" in low:
+      category = "timeout"
+    elif "429" in low or "rate limit" in low:
+      category = "rate_limit"
+    elif "proxy" in low:
+      category = "proxy"
+    else:
+      category = type(error).__name__
+    with _LOCK:
+      _ERRORS[category] = _ERRORS.get(category, 0) + 1
+    log_event("llm_errors", {
+        "call_type": call_type,
+        "model": model,
+        "ok": False,
+        "latency_seconds": latency_s,
+        "error_category": category,
+        "error_type": type(error).__name__,
+        "error_message": text[:400],
+    })
   except Exception:
     pass
 
@@ -132,6 +271,12 @@ def cost_summary():
   """Return a copy of accumulated per-model token totals."""
   with _LOCK:
     return {m: dict(v) for m, v in _COST.items()}
+
+
+def error_summary():
+  """Return categorized API failure counts."""
+  with _LOCK:
+    return dict(_ERRORS)
 
 
 def dump_cost_summary():
@@ -143,6 +288,7 @@ def dump_cost_summary():
         "sim_code": _CTX["sim_code"],
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "by_model": cost_summary(),
+        "errors_by_category": error_summary(),
         "note": ("token counts from API usage; USD cost requires a per-model "
                  "price table (TODO, fill in 02-protocols or a price config)."),
     }

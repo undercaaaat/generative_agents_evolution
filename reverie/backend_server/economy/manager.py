@@ -85,6 +85,22 @@ def get_shock_schedule():
   return _SHOCKS
 
 
+# --- Phase schedule registry (P13 main-run orchestration) ------------------
+# Default None preserves the pilot/P3 behavior. When attached, the manager
+# applies the t=0-frozen phase parameters by day: active resources, whether env
+# signals are active, and the fallback triangle-wave amplitude.
+_PHASES = None
+
+
+def set_phase_schedule(sched):
+  global _PHASES
+  _PHASES = sched
+
+
+def get_phase_schedule():
+  return _PHASES
+
+
 # --- Economic perception registry (C2) -------------------------------------
 # Module-level so prompt builders (run_gpt_prompt) can read the current
 # perception string by persona name without holding the manager instance,
@@ -139,10 +155,18 @@ class EconomyManager:
     except Exception:
       pass
 
-  def _resources(self):
-    """Active resource list: env model's if attached, else config's."""
+  def _resources(self, day_index=None):
+    """Active resource list: phase override, then env model, then config."""
+    phase = self.active_phase(day_index)
+    if phase and phase.get("active_resources"):
+      return list(phase["active_resources"])
     m = _ENV_MODEL
     return m.resources if (m is not None and m.resources) else self.cfg.RESOURCES
+
+  def active_phase(self, day_index=None):
+    """Return the attached frozen phase for a day, or None when phase-off."""
+    di = self._curr_day_index if day_index is None else day_index
+    return _PHASES.phase_for(di) if _PHASES is not None else None
 
   def price(self, resource, day_index=None):
     """Market unit price of a resource on a given day. Layers (all deterministic):
@@ -153,6 +177,9 @@ class EconomyManager:
          demand_shift), default none.
     Default (no model, no shocks) is byte-for-byte P3 behavior."""
     di = self._curr_day_index if day_index is None else day_index
+    phase_cfg = self.active_phase(di)
+    if resource not in self._resources(di):
+      return None
     m = _ENV_MODEL
     if m is not None:
       base = m.base_price(resource)
@@ -160,12 +187,16 @@ class EconomyManager:
         base = self.cfg.PRICES.get(resource)
       if base is None:
         return None
-      p = base * m.price_multiplier(resource, di)
+      signals_active = (phase_cfg.get("signals_active", True)
+                        if phase_cfg is not None else True)
+      p = base * (m.price_multiplier(resource, di) if signals_active else 1.0)
     else:
       base = self.cfg.PRICES.get(resource)
       if base is None:
         return None
-      amp = getattr(self.cfg, "PRICE_WAVE_AMPLITUDE", 0.0) or 0.0
+      amp = (phase_cfg.get("price_wave_amplitude", 0.0)
+             if phase_cfg is not None
+             else getattr(self.cfg, "PRICE_WAVE_AMPLITUDE", 0.0)) or 0.0
       if amp == 0.0:
         p = base
       else:
@@ -188,6 +219,9 @@ class EconomyManager:
           "income_today": 0.0,
           "days_bankrupt": 0,
       }
+    else:
+      for resource in self._resources():
+        self.states[name]["inventory"].setdefault(resource, 0)
     return self.states[name]
 
   def snapshot(self, name):
@@ -273,6 +307,12 @@ class EconomyManager:
     """Compact, factual economic-context block for prompt injection. Only
     objective facts -- NO advice/imperatives (guide 13.4: avoid steering)."""
     s = self.ensure_agent(name)
+    # Roundtable prompts call perception_str() directly rather than going
+    # through stamp_perception(). Keep the retrieval reranker context current
+    # on both paths so C2.5 sees the same factual economy snapshot.
+    _set_econ_context(name, {"cash": round(s["cash"], 2),
+                             "daily_cost": float(self.cfg.DAILY_NEED_COST),
+                             "bankrupt": s["bankrupt"]})
     prices = ", ".join(f"{r} {self.price(r)}" for r in self._resources())
     inv = ", ".join(f"{r} x{s['inventory'].get(r, 0)}" for r in self._resources())
     status = "bankrupt" if s["bankrupt"] else "solvent"

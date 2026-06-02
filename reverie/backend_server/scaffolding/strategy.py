@@ -16,6 +16,8 @@ machine, fitness/mutation bookkeeping, and the compact selection summary injecte
 into the daily-plan prompt. The LLM only PROPOSES strategy text (wiring step 2);
 parsing/cleaning reuses the run_gpt_prompt anti-chatter discipline.
 """
+import copy
+import hashlib
 import itertools
 import re
 
@@ -41,6 +43,27 @@ _ALLOWED = {
 
 def new_strategy_id():
   return f"s_{next(_ids)}"
+
+
+def checkpoint_state():
+  """Return JSON-safe strategy store and ID state for roundtable resume."""
+  try:
+    next_id = int(_ids.__reduce__()[1][0])
+  except Exception:
+    next_id = 1
+  return {"next_id": next_id, "store": copy.deepcopy(_STORE)}
+
+
+def restore_checkpoint_state(state):
+  """Restore strategy state after an interrupted roundtable run."""
+  global _ids
+  _STORE.clear()
+  try:
+    _STORE.update(copy.deepcopy((state or {}).get("store", {})))
+    _ids = itertools.count(max(1, int((state or {}).get("next_id", 1))))
+  except Exception:
+    _STORE.clear()
+    _ids = itertools.count(1)
 
 
 def is_internal_field(name):
@@ -209,11 +232,12 @@ def active_strategy_id(agent_name):
   return act[-1]["internal_strategy_id"] if act else None
 
 
-def record_strategy(agent_name, strat, event="proposed"):
+def record_strategy(agent_name, strat, event="proposed", **audit):
   """Add/track a strategy for an agent and log the event to agent_internal."""
   _STORE.setdefault(agent_name, []).append(strat)
-  _log_internal({"persona": agent_name, "event": event,
-                 "strategy": strat})
+  record = {"persona": agent_name, "event": event, "strategy": strat}
+  record.update({k: v for k, v in audit.items() if v is not None})
+  _log_internal(record)
 
 
 def log_binding(agent_name, action_id, strategy_id):
@@ -239,14 +263,12 @@ def update_fitness(agent_name, reward):
                  "history": s["internal_fitness_history_self_reported"]})
 
 
-def run_daily_strategy(agent_name, manager, curr_time):
-  """C3 proposal+selection (1 LLM call/agent/day). Builds the proposal prompt
-  from the economic perception + current strategies, parses, and adds a new
-  trial strategy if proposed. Returns the active internal_strategy_id (for
-  action binding). Guarded; never raises."""
+def prepare_daily_strategy(agent_name, manager, curr_time, *,
+                           logical_order=None, scheduler_mode="serial"):
+  """Read state and generate one strategy proposal. Does not mutate _STORE."""
   try:
     if manager is None:
-      return active_strategy_id(agent_name)
+      return None
     try:
       date_str = curr_time.strftime("%A %B %d")
     except Exception:
@@ -263,14 +285,47 @@ def run_daily_strategy(agent_name, manager, curr_time):
     except Exception:
       raw = None
     proposal = parse_strategy_proposal(raw)
+    return {
+        "raw": raw,
+        "proposal": proposal,
+        "date_str": date_str,
+        "logical_order": logical_order,
+        "scheduler_mode": scheduler_mode,
+        "prompt_hash": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+    }
+  except Exception:
+    return None
+
+
+def commit_daily_strategy(agent_name, candidate):
+  """Commit a prepared proposal in deterministic persona order."""
+  try:
+    candidate = candidate or {}
+    raw = candidate.get("raw")
+    proposal = candidate.get("proposal")
     _log_internal({"persona": agent_name, "event": "proposal_attempt",
                    "raw_response": (str(raw)[:600] if raw is not None else None),
-                   "proposed": proposal})
+                   "proposed": proposal,
+                   "logical_order": candidate.get("logical_order"),
+                   "scheduler_mode": candidate.get("scheduler_mode", "serial"),
+                   "prompt_hash": candidate.get("prompt_hash")})
     if proposal:
       strat = new_strategy(agent_name, proposal["name"], proposal["description"],
-                           created_at=date_str)
+                           created_at=candidate.get("date_str", ""))
       strat["status"] = "trial"          # selected to try today
-      record_strategy(agent_name, strat, event="proposed_trial")
+      record_strategy(
+          agent_name, strat, event="proposed_trial",
+          logical_order=candidate.get("logical_order"),
+          scheduler_mode=candidate.get("scheduler_mode", "serial"))
     return active_strategy_id(agent_name)
   except Exception:
     return None
+
+
+def run_daily_strategy(agent_name, manager, curr_time, *, logical_order=None,
+                       scheduler_mode="serial"):
+  """Serial proposal+selection wrapper. Barrier mode uses prepare/commit."""
+  candidate = prepare_daily_strategy(
+      agent_name, manager, curr_time, logical_order=logical_order,
+      scheduler_mode=scheduler_mode)
+  return commit_daily_strategy(agent_name, candidate)

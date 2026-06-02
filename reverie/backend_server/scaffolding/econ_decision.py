@@ -26,18 +26,25 @@ if _BACKEND not in sys.path:
 try:
   from economy import config as _econ_config
   _CONFIG_RESOURCES = {r.lower() for r in _econ_config.RESOURCES}
+  _KNOWN_CONFIG_RESOURCES = {r.lower() for r in _econ_config.PRICES}
 except Exception:
   _CONFIG_RESOURCES = set()
+  _KNOWN_CONFIG_RESOURCES = set()
 
 from scaffolding import action_api
 
 
-def _active_resources():
+def _active_resources(manager=None):
   """Resources the agent may trade RIGHT NOW: the attached EnvironmentModel's
   (de-semanticized alpha_good/... when GA_ENV_CONFIG is set), else the config
   default (semantic food/coffee/...). Sourced at call time so the de-sem swap
   reaches both the decision prompt and the trade validation -- the import-time
   set would freeze the agent to semantic resources and reject alpha_good."""
+  if manager is not None:
+    try:
+      return {r.lower() for r in manager._resources()}
+    except Exception:
+      pass
   try:
     from economy import manager as _mgr
     m = _mgr.get_env_model()
@@ -46,6 +53,11 @@ def _active_resources():
   except Exception:
     pass
   return _CONFIG_RESOURCES
+
+
+def _known_resources(manager=None):
+  """Parser universe. The manager remains the final phase-legality gate."""
+  return _active_resources(manager) | _KNOWN_CONFIG_RESOURCES
 
 _SIDES = ("buy", "sell")
 # Lines that signal "no trades today" -> empty decision (a legal outcome).
@@ -61,19 +73,19 @@ _RE_SIDE_QTY_ITEM = re.compile(r"\b(buy|sell)\b[^\d-]*?(\d+)\s+([a-z_]+)")
 _RE_SIDE_ITEM_QTY = re.compile(r"\b(buy|sell)\b\s+([a-z_]+)[^\d-]*?(\d+)")
 
 
-def _norm_one(side, item, qty):
+def _norm_one(side, item, qty, manager=None):
   side = (side or "").lower().strip()
   item = (item or "").lower().strip()
   try:
     qty = int(qty)
   except Exception:
     return None
-  if side not in _SIDES or item not in _active_resources() or qty <= 0:
+  if side not in _SIDES or item not in _known_resources(manager) or qty <= 0:
     return None
   return {"item": item, "qty": qty, "side": side}
 
 
-def _parse_json(text):
+def _parse_json(text, manager=None):
   try:
     data = json.loads(text)
   except Exception:
@@ -85,13 +97,14 @@ def _parse_json(text):
   out = []
   for d in data:
     if isinstance(d, dict):
-      one = _norm_one(d.get("side"), d.get("item"), d.get("qty", d.get("quantity")))
+      one = _norm_one(d.get("side"), d.get("item"),
+                      d.get("qty", d.get("quantity")), manager=manager)
       if one:
         out.append(one)
   return out
 
 
-def parse_trade_decisions(raw_text):
+def parse_trade_decisions(raw_text, manager=None):
   """Parse an LLM economic-decision response into a clean list of
   {item, qty, side}. Robust to JSON, line forms, chatty prose, and 'none'.
   Returns [] for an empty/none/garbled decision (a legal no-op). Never raises."""
@@ -100,7 +113,7 @@ def parse_trade_decisions(raw_text):
   text = str(raw_text).strip()
 
   # 1) Prefer structured JSON if present.
-  js = _parse_json(text)
+  js = _parse_json(text, manager=manager)
   if js is not None:
     return js
 
@@ -120,7 +133,7 @@ def parse_trade_decisions(raw_text):
     side, a, b = m.group(1), m.group(2), m.group(3)
     # group order differs between the two patterns: figure out which is qty
     qty, item = (a, b) if a.isdigit() else (b, a)
-    one = _norm_one(side, item, qty)
+    one = _norm_one(side, item, qty, manager=manager)
     if one:
       out.append(one)
   return out
@@ -144,7 +157,7 @@ def build_decision_prompt(manager, agent_name, date_str=""):
     perception = manager.perception_str(agent_name, date_str)
   except Exception:
     perception = "[Economic situation]"
-  resources = ", ".join(sorted(_active_resources())) or "food, coffee, ingredients"
+  resources = ", ".join(sorted(_active_resources(manager))) or "food, coffee, ingredients"
   return perception + "\n\n" + _DECISION_INSTRUCTION.format(
       name=agent_name, resources=resources)
 
@@ -169,7 +182,7 @@ def run_daily_decision(agent_name, manager, curr_time, *, bind_strategy_id=None)
       raw = ChatGPT_single_request(prompt)
     except Exception:
       return []
-    decisions = parse_trade_decisions(raw)
+    decisions = parse_trade_decisions(raw, manager=manager)
     # raw strategy_id stays None (firewall); binding logged to agent_internal below
     records = execute_decisions(manager, agent_name, decisions, strategy_id=None)
     if bind_strategy_id:

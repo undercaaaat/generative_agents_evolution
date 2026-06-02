@@ -8,10 +8,10 @@ RNG or runtime researcher input (guide 6.6: 0 interventions during a run):
   ShockSchedule  — predefined shocks; exposes a deterministic price multiplier
                    and resource availability (store_closure blocks BUYS).
 
-manager.py optionally consults a registered ShockSchedule in price()/trade()
-(guarded; default None -> P3 behavior, existing tests unchanged). The phase
-schedule is a query for the harness (it sets per-phase params at run setup);
-it is not wired into manager pricing here (that orchestration is P11).
+manager.py optionally consults registered phase + shock schedules in
+price()/trade() (guarded; default None -> P3 behavior, existing tests
+unchanged). The phase schedule is attached by the run harness before a main
+run starts and remains frozen for the whole run.
 """
 import json
 

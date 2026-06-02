@@ -28,7 +28,14 @@ openai.proxy = apply_network_proxy()
 # on reads from urllib3-pooled connections after 127.0.0.1:7890 hiccuped).
 # We hard-cap each create() at GA_LLM_WALL_TIMEOUT seconds (default 90).
 _WALL_TIMEOUT = float(os.environ.get("GA_LLM_WALL_TIMEOUT", "90"))
-_WALL_EXECUTOR = _futures.ThreadPoolExecutor(max_workers=4,
+_PARALLEL_PREPARE_WORKERS = int(os.environ.get("GA_PARALLEL_MAX_WORKERS", "4"))
+_DEFAULT_WALL_WORKERS = (
+    max(4, 2 * _PARALLEL_PREPARE_WORKERS)
+    if os.environ.get("GA_PARALLEL_LLM", "0").strip() == "1"
+    else 4)
+_WALL_WORKERS = max(
+    1, int(os.environ.get("GA_LLM_WALL_WORKERS", str(_DEFAULT_WALL_WORKERS))))
+_WALL_EXECUTOR = _futures.ThreadPoolExecutor(max_workers=_WALL_WORKERS,
                                              thread_name_prefix="llm-wall")
 
 
@@ -62,7 +69,7 @@ def _mark_llm_progress():
   _LAST_LLM_OK_TS[0] = time.time()
 
 
-def _meter(call_type, model, response):
+def _meter(call_type, model, response, latency_s=None):
   """Record token usage from an API response. Side-effect-free; never raises."""
   _mark_llm_progress()
   if telemetry_log is None:
@@ -74,7 +81,14 @@ def _meter(call_type, model, response):
       usage = getattr(response, "usage", None)
   except Exception:
     usage = None
-  telemetry_log.record_llm_call(call_type, model, usage)
+  telemetry_log.record_llm_call(call_type, model, usage, latency_s=latency_s)
+
+
+def _meter_error(call_type, model, error, latency_s=None):
+  """Record ops-only API failures without changing exception behavior."""
+  if telemetry_log is not None:
+    telemetry_log.record_llm_error(
+        call_type, model, error, latency_s=latency_s)
 
 
 def _print_api_error(label, error):
@@ -99,8 +113,13 @@ def _chat_completion_create(model, messages, **kwargs):
   headers = get_openrouter_headers()
   if headers:
     kwargs["headers"] = headers
-  response = _call_with_wall_timeout(openai.ChatCompletion.create, **kwargs)
-  _meter("chat", model, response)
+  started = time.perf_counter()
+  try:
+    response = _call_with_wall_timeout(openai.ChatCompletion.create, **kwargs)
+  except Exception as error:
+    _meter_error("chat", model, error, time.perf_counter() - started)
+    raise
+  _meter("chat", model, response, time.perf_counter() - started)
   return response
 
 
@@ -109,8 +128,15 @@ def _completion_create(**kwargs):
   headers = get_openrouter_headers()
   if headers:
     kwargs["headers"] = headers
-  response = _call_with_wall_timeout(openai.Completion.create, **kwargs)
-  _meter("completion", kwargs.get("model"), response)
+  started = time.perf_counter()
+  try:
+    response = _call_with_wall_timeout(openai.Completion.create, **kwargs)
+  except Exception as error:
+    _meter_error("completion", kwargs.get("model"), error,
+                 time.perf_counter() - started)
+    raise
+  _meter("completion", kwargs.get("model"), response,
+         time.perf_counter() - started)
   return response
 
 
@@ -119,8 +145,13 @@ def _embedding_create(input, model):
   headers = get_openrouter_headers()
   if headers:
     kwargs["headers"] = headers
-  response = _call_with_wall_timeout(openai.Embedding.create, **kwargs)
-  _meter("embedding", model, response)
+  started = time.perf_counter()
+  try:
+    response = _call_with_wall_timeout(openai.Embedding.create, **kwargs)
+  except Exception as error:
+    _meter_error("embedding", model, error, time.perf_counter() - started)
+    raise
+  _meter("embedding", model, response, time.perf_counter() - started)
   return response
 
 
